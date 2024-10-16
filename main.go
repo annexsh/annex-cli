@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 
+	"github.com/annexsh/annex/log"
 	"github.com/annexsh/annex/server"
 	"github.com/annexsh/annex/uuid"
 	"github.com/annexsh/annex/workflowservice"
 	"github.com/lmittmann/tint"
 	"github.com/temporalio/cli/temporalcli/devserver"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -22,70 +24,81 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		panic(err)
+		if errors.Is(err, context.Canceled) {
+			fmt.Println("stopped development server")
+			return
+		}
+		fmt.Println(err)
+		os.Exit(1)
 	}
 }
 
 func run() error {
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
 
-	temporalSrv, temporalAddr, err := setupTemporalDevServer()
+	temporalSrv, temporalAddr, err := startTemporalDevServer()
 	if err != nil {
 		return err
 	}
 	defer temporalSrv.Stop()
 
-	errg := new(errgroup.Group)
-
 	uiAddr := fmt.Sprintf("%s:%d", ip, uiPort)
 
-	cfg := server.AllInOneConfig{
-		Port:              serverPort,
-		CorsOrigins:       []string{"http://" + uiAddr},
-		StructuredLogging: false,
-		SQLite:            true,
-		Nats: server.NatsConfig{
-			HostPort: fmt.Sprintf("%s:%d", ip, devserver.MustGetFreePort()),
-			Embedded: true,
-		},
-		Temporal: server.TemporalConfig{
-			HostPort:  temporalAddr,
-			Namespace: workflowservice.Namespace,
-		},
+	errs := make(chan error, 1)
+
+	go func() {
+		errs <- server.ServeAllInOne(ctx, server.AllInOneConfig{
+			Port:              serverPort,
+			CorsOrigins:       []string{"http://" + uiAddr},
+			StructuredLogging: false,
+			SQLite:            true,
+			Nats: server.NatsConfig{
+				HostPort: fmt.Sprintf("%s:%d", ip, freePort()),
+				Embedded: true,
+			},
+			Temporal: server.TemporalConfig{
+				HostPort:  temporalAddr,
+				Namespace: workflowservice.Namespace,
+			},
+		})
+	}()
+
+	logger := log.NewDevLogger()
+	logger.Info("serving ui on http://" + uiAddr)
+	uiSrv := newUIServer()
+	go func() {
+		errs <- uiSrv.Start(uiAddr)
+	}()
+	defer uiSrv.Close()
+
+	select {
+	case err = <-errs:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-
-	errg.Go(func() error {
-		return server.ServeAllInOne(ctx, cfg)
-	})
-
-	errg.Go(func() error {
-		uiSrv := newUIServer()
-		if uiErr := uiSrv.Start(uiAddr); uiErr != nil {
-			return uiErr
-		}
-		return uiSrv.Close()
-	})
-
-	slog.Info("serving UI on http://" + uiAddr)
-
-	return errg.Wait()
 }
 
-func setupTemporalDevServer() (*devserver.Server, string, error) {
-	port := devserver.MustGetFreePort()
+func startTemporalDevServer() (*devserver.Server, string, error) {
+	port := freePort()
 	address := fmt.Sprintf("%s:%d", ip, port)
 	srv, err := devserver.Start(devserver.StartOptions{
 		FrontendIP:             ip,
 		FrontendPort:           port,
 		UIIP:                   ip,
-		UIPort:                 devserver.MustGetFreePort(),
+		UIPort:                 freePort(),
 		Namespaces:             []string{workflowservice.Namespace},
 		ClusterID:              uuid.NewString(),
 		MasterClusterName:      "active",
 		CurrentClusterName:     "active",
 		InitialFailoverVersion: 1,
 		Logger:                 slog.New(tint.NewHandler(os.Stdout, nil)),
-		LogLevel:               slog.LevelWarn,
+		LogLevel:               slog.LevelError,
 	})
 	return srv, address, err
+}
+
+func freePort() int {
+	return devserver.MustGetFreePort(ip)
 }
