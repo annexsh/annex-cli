@@ -12,6 +12,8 @@ const indexPage = "index.html"
 
 func newUIServer() *echo.Echo {
 	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
